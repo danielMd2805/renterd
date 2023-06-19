@@ -221,10 +221,16 @@ func (h *host) FetchRevision(ctx context.Context, fetchTimeout time.Duration, bl
 	ctx, cancel = timeoutCtx()
 	defer cancel()
 	rev, err = h.fetchRevisionWithContract(ctx, h.HostKey(), h.siamuxAddr, h.fcid)
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), ErrInsufficientFunds.Error()) {
 		return types.FileContractRevision{}, err
+	} else if err == nil {
+		return rev, nil
 	}
-	return rev, nil
+
+	// If we don't have enough money in the contract, try again without paying.
+	ctx, cancel = timeoutCtx()
+	defer cancel()
+	return h.fetchRevisionNoPayment(ctx, h.HostKey(), h.siamuxAddr, h.fcid)
 }
 
 func (h *host) fetchRevisionWithAccount(ctx context.Context, hostKey types.PublicKey, siamuxAddr string, bh uint64, contractID types.FileContractID) (rev types.FileContractRevision, err error) {
@@ -266,6 +272,16 @@ func (h *host) fetchRevisionWithContract(ctx context.Context, hostKey types.Publ
 				return rhpv3.HostPriceTable{}, nil, err
 			}
 			return pt, &payment, nil
+		})
+		return err
+	})
+	return rev, err
+}
+
+func (h *host) fetchRevisionNoPayment(ctx context.Context, hostKey types.PublicKey, siamuxAddr string, contractID types.FileContractID) (rev types.FileContractRevision, err error) {
+	err = h.transportPool.withTransportV3(ctx, hostKey, siamuxAddr, func(t *transportV3) (err error) {
+		rev, err = RPCLatestRevision(ctx, t, contractID, func(rev *types.FileContractRevision) (rhpv3.HostPriceTable, rhpv3.PaymentMethod, error) {
+			return rhpv3.HostPriceTable{}, nil, nil
 		})
 		return err
 	})

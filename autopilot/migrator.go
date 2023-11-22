@@ -11,6 +11,7 @@ import (
 
 	"go.sia.tech/renterd/api"
 	"go.sia.tech/renterd/object"
+	"go.sia.tech/renterd/stats"
 	"go.sia.tech/renterd/tracing"
 	"go.uber.org/zap"
 )
@@ -21,11 +22,12 @@ const (
 
 type (
 	migrator struct {
-		ap                        *Autopilot
-		logger                    *zap.SugaredLogger
-		healthCutoff              float64
-		parallelSlabsPerWorker    uint64
-		signalMaintenanceFinished chan struct{}
+		ap                             *Autopilot
+		logger                         *zap.SugaredLogger
+		healthCutoff                   float64
+		parallelSlabsPerWorker         uint64
+		signalMaintenanceFinished      chan struct{}
+		statsSlabMigrationEstimateInMS *stats.DataPoints
 
 		mu                 sync.Mutex
 		migrating          bool
@@ -60,11 +62,12 @@ func (j *job) execute(ctx context.Context, w Worker) (_ api.MigrateSlabResponse,
 
 func newMigrator(ap *Autopilot, healthCutoff float64, parallelSlabsPerWorker uint64) *migrator {
 	return &migrator{
-		ap:                        ap,
-		logger:                    ap.logger.Named("migrator"),
-		healthCutoff:              healthCutoff,
-		parallelSlabsPerWorker:    parallelSlabsPerWorker,
-		signalMaintenanceFinished: make(chan struct{}, 1),
+		ap:                             ap,
+		logger:                         ap.logger.Named("migrator"),
+		healthCutoff:                   healthCutoff,
+		parallelSlabsPerWorker:         parallelSlabsPerWorker,
+		signalMaintenanceFinished:      make(chan struct{}, 1),
+		statsSlabMigrationEstimateInMS: stats.Default(),
 	}
 }
 
@@ -79,6 +82,20 @@ func (m *migrator) Status() (bool, time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.migrating, m.migratingLastStart
+}
+
+func (m *migrator) estimatedDuration(n int) time.Duration {
+	// recompute p90
+	m.statsSlabMigrationEstimateInMS.Recompute()
+
+	// return 0 if p90 is 0 (can happen if we haven't collected enough data points)
+	p90 := m.statsSlabMigrationEstimateInMS.P90()
+	if p90 == 0 {
+		return 0
+	}
+
+	durMS := time.Duration(p90) * time.Millisecond
+	return durMS * time.Duration(n)
 }
 
 func (m *migrator) tryPerformMigrations(ctx context.Context, wp *workerPool) {
@@ -133,6 +150,7 @@ func (m *migrator) performMigrations(p *workerPool) {
 
 					// process jobs
 					for j := range jobs {
+						start := time.Now()
 						res, err := j.execute(ctx, w)
 						if err != nil {
 							m.logger.Errorf("%v: migration %d/%d failed, key: %v, health: %v, overpaid: %v, err: %v", id, j.slabIdx+1, j.batchSize, j.Key, j.Health, res.SurchargeApplied, err)
@@ -142,6 +160,8 @@ func (m *migrator) performMigrations(p *workerPool) {
 								m.ap.RegisterAlert(ctx, newMigrationFailedAlert(j.Key, j.Health, err))
 							}
 							continue
+						} else {
+							m.statsSlabMigrationEstimateInMS.Track(float64(time.Since(start).Milliseconds()))
 						}
 
 						m.logger.Infof("%v: migration %d/%d succeeded, key: %v, health: %v, overpaid: %v, shards migrated: %v", id, j.slabIdx+1, j.batchSize, j.Key, j.Health, res.SurchargeApplied, res.NumShardsMigrated)
@@ -228,7 +248,7 @@ OUTER:
 
 		// register an alert to notify users about ongoing migrations.
 		if len(toMigrate) > 0 {
-			m.ap.RegisterAlert(ctx, newOngoingMigrationsAlert(len(toMigrate)))
+			m.ap.RegisterAlert(ctx, newOngoingMigrationsAlert(len(toMigrate), m.estimatedDuration(len(toMigrate))))
 		}
 
 		// return if there are no slabs to migrate

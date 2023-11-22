@@ -150,11 +150,17 @@ func newLostSectorsAlert(hk types.PublicKey, lostSectors uint64) alerts.Alert {
 	}
 }
 
-func newOngoingMigrationsAlert(n int) alerts.Alert {
+func newOngoingMigrationsAlert(n int, estimate time.Duration) alerts.Alert {
+	msg := fmt.Sprintf("Migrating %d slabs", n)
+	if estimate > 0 {
+		estimate = estimate.Truncate(time.Minute)
+		msg += fmt.Sprintf(" (estimated remaining duration ~ %v)", estimate)
+	}
+
 	return alerts.Alert{
 		ID:        alertMigrationID,
 		Severity:  alerts.SeverityInfo,
-		Message:   fmt.Sprintf("Migrating %d slabs", n),
+		Message:   msg,
 		Timestamp: time.Now(),
 	}
 }
